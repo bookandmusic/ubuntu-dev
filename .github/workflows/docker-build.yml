@@ -1,0 +1,199 @@
+name: Build and Push Docker Image with WSL Export
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build, Push and Export for WSL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 登录 GHCR
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # 3. 获取短提交 SHA
+      - name: Extract short commit SHA
+        id: vars
+        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # 4. 构建并推送 AMD64 镜像
+      - name: Build and push single-arch image (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/ubuntu-dev:latest
+            ghcr.io/${{ github.repository_owner }}/ubuntu-dev:${{ env.COMMIT_SHA }}
+
+      # 5. 导出 WSL 分发包
+      - name: Prepare WSL distribution package
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/ubuntu-dev:${{ env.COMMIT_SHA }}
+          DISTRO_NAME=ubuntu-dev-${{ env.COMMIT_SHA }}
+          TAR_FILE=$DISTRO_NAME.tar
+          
+          # 使用docker export（WSL兼容格式）
+          docker run -d --name wsl_builder $IMAGE tail -f /dev/null
+          docker export wsl_builder -o $TAR_FILE
+          docker stop wsl_builder
+          docker rm wsl_builder
+          
+          echo "TAR_FILE=$TAR_FILE" >> $GITHUB_ENV
+          echo "DISTRO_NAME=$DISTRO_NAME" >> $GITHUB_ENV
+
+      # 6. 压缩 tar 文件
+      - name: Compress tar file
+        run: |
+          # 压缩 tar 文件
+          gzip -9 "${{ env.TAR_FILE }}"
+          COMPRESSED_FILE="${{ env.TAR_FILE }}.gz"
+          echo "COMPRESSED_FILE=$COMPRESSED_FILE" >> $GITHUB_ENV
+          
+          # 检查压缩后文件大小
+          FILE_SIZE=$(stat -c%s "$COMPRESSED_FILE")
+          echo "Compressed file size: $FILE_SIZE bytes"
+          echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+
+      # 7. 根据文件大小决定是否分割
+      - name: Check and split file if needed
+        run: |
+          MAX_SIZE=2147483648  # 2GB
+          
+          if [ ${{ env.FILE_SIZE }} -gt $MAX_SIZE ]; then
+            echo "Compressed file exceeds 2GB, splitting into parts..."
+            split -b 1800m "${{ env.COMPRESSED_FILE }}" "${{ env.COMPRESSED_FILE }}.part."
+            echo "UPLOAD_FILES=${{ env.COMPRESSED_FILE }}.part.*" >> $GITHUB_ENV
+            echo "NEEDS_MERGE=true" >> $GITHUB_ENV
+            echo "FILE_TYPE=compressed_split" >> $GITHUB_ENV
+          else
+            echo "Compressed file is under 2GB, no need to split"
+            echo "UPLOAD_FILES=${{ env.COMPRESSED_FILE }}" >> $GITHUB_ENV
+            echo "NEEDS_MERGE=false" >> $GITHUB_ENV
+            echo "FILE_TYPE=compressed" >> $GITHUB_ENV
+          fi
+
+      # 8. 创建详细的导入说明文件
+      - name: Create detailed instructions file
+        run: |
+          if [ "${{ env.NEEDS_MERGE }}" = "true" ]; then
+            GUIDE_CONTENT='
+          # WSL 导入指南
+
+          ## 文件信息
+          - 分发版名称: ubuntu-dev-${{ env.COMMIT_SHA }}
+          - 文件格式: 压缩分卷的 tar.gz 包
+          - 使用前需要: 合并分卷 + 解压缩
+
+          ## 步骤 1: 下载文件
+          下载所有 `ubuntu-dev-${{ env.COMMIT_SHA }}.tar.gz.part.*` 文件到同一文件夹
+
+          ## 步骤 2: 合并文件
+
+          ### 方法一：使用命令提示符（CMD - 推荐）
+          ```cmd
+          copy /b ubuntu-dev-${{ env.COMMIT_SHA }}.tar.gz.part.* ubuntu-dev-${{ env.COMMIT_SHA }}.tar.gz
+          ```
+
+          ### 方法二：使用 PowerShell
+          ```powershell
+          cmd /c "copy /b ubuntu-dev-${{ env.COMMIT_SHA }}.tar.gz.part.* ubuntu-dev-${{ env.COMMIT_SHA }}.tar.gz"
+          ```
+
+          ## 步骤 3: 解压缩文件
+          使用工具如 7-Zip 解压, 得到 ubuntu-dev-${{ env.COMMIT_SHA }}.tar
+
+          ## 步骤 4: 导入到 WSL
+          在 PowerShell 或命令提示符中（需要管理员权限）：
+          ```powershell
+          # 创建安装目录
+          mkdir C:\WSL\ubuntu-dev-${{ env.COMMIT_SHA }}
+
+          # 导入 WSL 分发版
+          wsl --import ubuntu-dev-${{ env.COMMIT_SHA }} C:\WSL\ubuntu-dev-${{ env.COMMIT_SHA }} ubuntu-dev-${{ env.COMMIT_SHA }}.tar --version 2
+
+          # 运行 WSL
+          wsl -d ubuntu-dev-${{ env.COMMIT_SHA }}
+          ```
+
+          ## 验证导入
+          ```powershell
+          wsl -l -v
+          ```'
+          else
+            GUIDE_CONTENT='
+          # WSL 导入指南
+
+          ## 文件信息
+          - 分发版名称: ubuntu-dev-${{ env.COMMIT_SHA }}
+          - 文件格式: 压缩的 tar.gz 包
+          - 使用前需要: 解压缩
+
+          ## 步骤 1: 下载文件
+          下载 `ubuntu-dev-${{ env.COMMIT_SHA }}.tar.gz` 文件
+
+          ## 步骤 2: 解压缩文件
+          使用工具如 7-Zip 解压, 得到 ubuntu-dev-${{ env.COMMIT_SHA }}.tar
+
+          ## 步骤 3: 导入到 WSL
+          在 PowerShell 或命令提示符中（需要管理员权限）：
+          ```powershell
+          # 创建安装目录
+          mkdir C:\WSL\ubuntu-dev-${{ env.COMMIT_SHA }}
+
+          # 导入 WSL 分发版
+          wsl --import ubuntu-dev-${{ env.COMMIT_SHA }} C:\WSL\ubuntu-dev-${{ env.COMMIT_SHA }} ubuntu-dev-${{ env.COMMIT_SHA }}.tar --version 2
+
+          # 运行 WSL
+          wsl -d ubuntu-dev-${{ env.COMMIT_SHA }}
+          ```
+
+          ## 验证导入
+          ```powershell
+          wsl -l -v
+          ```'
+          fi
+          
+          echo "$GUIDE_CONTENT" > WSL_IMPORT_GUIDE.md
+          echo "GUIDE_FILE=WSL_IMPORT_GUIDE.md" >> $GITHUB_ENV
+
+      # 9. 创建 Release 并上传文件
+      - name: Create Release with WSL distribution
+        uses: ncipollo/release-action@v1.20.0
+        with:
+          tag: ${{ env.COMMIT_SHA }}
+          name: WSL Distribution - ubuntu-dev-${{ env.COMMIT_SHA }}
+          artifacts: |
+            ${{ github.workspace }}/${{ env.UPLOAD_FILES }}
+            ${{ github.workspace }}/${{ env.GUIDE_FILE }}
+          body: |
+            ## WSL操作
+            📖 **详细说明请下载 [WSL_IMPORT_GUIDE.md](../../releases/download/${{ env.COMMIT_SHA }}/WSL_IMPORT_GUIDE.md)**
+            
+            ## 镜像信息
+            - 基于提交: ${{ env.COMMIT_SHA }}
+            - 镜像地址: ghcr.io/${{ github.repository_owner }}/ubuntu-dev:${{ env.COMMIT_SHA }}
+          allowUpdates: true
+          generateReleaseNotes: false
+
+      # 10. 清理步骤
+      - name: Clean up
+        if: always()
+        run: |
+          # 删除本地生成的临时文件
+          rm -f ${{ env.TAR_FILE }} ${{ env.COMPRESSED_FILE }} ${{ env.COMPRESSED_FILE }}.part.* ${{ env.GUIDE_FILE }} 2>/dev/null || true
